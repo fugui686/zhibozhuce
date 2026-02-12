@@ -1,0 +1,500 @@
+import sys, os, time, configparser, unicodedata
+from datetime import datetime, timedelta, timezone
+from collections import defaultdict
+import requests
+from PyQt5.QtCore import Qt, QTimer, QByteArray
+from PyQt5.QtGui import (
+    QFont, QPainter, QPixmap, QColor, QPalette, QBrush, QIntValidator, QIcon
+)
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QLineEdit, QTextEdit, QPushButton, QMessageBox,
+    QPlainTextEdit, QLabel, QGroupBox, QProgressBar, QCheckBox, QFileDialog
+)
+
+APP_TITLE = "出款记录"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(APP_DIR, "config.ini")
+
+API_PATH = "/api/transfermodule/WithdrawRecord/GetPageListAsync"
+PAGE_SIZE = 50
+REQUEST_INTERVAL_SECONDS = 0.12
+
+# ---------- 工具函数 ----------
+def robust_parse_dt(s: str):
+    if not s:
+        return None
+    s = s.strip()
+    z = s.endswith("Z")
+    if z:
+        s = s[:-1]
+    fmts = [
+        "%Y-%m-%d %H:%M:%S","%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S.%f","%Y-%m-%dT%H:%M:%S",
+        "%Y/%m/%d %H:%M:%S","%Y/%m/%d %H:%M",
+    ]
+    for fmt in fmts:
+        try:
+            dt = datetime.strptime(s, fmt)
+            if z:
+                dt = dt.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+            return dt
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+def build_tianzige_background(cell=22, line_color=QColor(230,230,230), bold_color=QColor(210,210,210)):
+    pix = QPixmap(cell*4, cell*4)
+    pix.fill(Qt.white)
+    p = QPainter(pix); p.setRenderHint(QPainter.Antialiasing, False)
+    p.setPen(line_color)
+    for x in range(0, pix.width(), cell): p.drawLine(x,0,x,pix.height())
+    for y in range(0, pix.height(), cell): p.drawLine(0,y,pix.width(),y)
+    p.setPen(bold_color); step = cell*2
+    for x in range(0, pix.width(), step): p.drawLine(x,0,x,pix.height())
+    for y in range(0, pix.height(), step): p.drawLine(0,y,pix.width(),y)
+    p.end()
+    return pix
+
+def nice_sep(char="-", width=72): return char*width
+
+def ea_width(s: str) -> int:
+    """East Asian 显示宽度：中文全角=2，ASCII=1"""
+    w = 0
+    for ch in s:
+        e = unicodedata.east_asian_width(ch)
+        w += 2 if e in ("F","W") else 1
+    return w
+
+def pad_right_ea(s: str, total_width: int) -> str:
+    cur = ea_width(s)
+    spaces = max(0, total_width - cur)
+    return s + " " * spaces
+
+# ---------- Toast（气泡提示） ----------
+# 用这个替换你代码中的 Toast 类
+class Toast(QLabel):
+    def __init__(self, parent, text, ms=2000):
+        super().__init__(parent)
+        self.setText(text)
+        self.setStyleSheet("""
+            QLabel {
+                background: rgba(0,0,0,0.75);
+                color: #fff;
+                padding: 10px 18px;
+                border-radius: 10px;
+                font-size: 13px;
+            }
+        """)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.adjustSize()
+
+        # —— 居中定位（相对 parent 的可视区域）——
+        pr = parent.rect()
+        x = pr.center().x() - self.width() // 2
+        y = pr.center().y() - self.height() // 2
+        # 如果想稍微偏下显示一点，可以加一个偏移量，比如 +40：
+        # y += 40
+        self.move(x, y)
+
+        self.show()
+        QTimer.singleShot(ms, self.close)
+
+
+# ---------- 主窗体 ----------
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP_TITLE)
+        self.resize(1100, 760)
+        self.check_network_validation()
+
+        # 加载 base64 图标（确保字符串完整）
+        icon_base64 = "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//8iV///Ilf//yJX//8iV///Ilf//yJW//IiV/+HGFX/FQAAAAAAAAAAAAAAACFV/ychV//OIlf/5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/PSFW/88iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV//2Ilf/ryJX/5AiV/+1Ilf/+iJX//8iV//aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJEn/ByFW/5IiVv/+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/6UAAAAAAAAAAAAAAAAAAAAAAAAAACBV/xghVv/JIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/TAAAAAAAAAAAAAAAAAAAAAAhWv8fIVf/3SJX//8iV///Ilf//yJX/+giVv+9IVf/oSJX/5YiV/+cIlb/tCJX/98iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/84AAP8BAAAAAAAAAAAAAAAAIVn/FyJX/9wiV///Ilb/ySJV/28jVf8kAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFS/x8hV/91Ilf/4CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8hV//8IFf/OAAAAAAAAAAAAAAAACpV/wYiV//FIlf/rSJY/zQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYgVv+OIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/4gAAAAAAAAAAAAAAAAAAAAAIVf/VSBT/zcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhWf8XIlf/xSJX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AAAAAAAAIlb/dyJX//8hVv/PG1H/EwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIGD/CABV/wMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABxV/wkhV//lIVf/wh5a/xEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/eiJX/5wkSf8HAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFZ/xciVv9TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKAAAADAAAABgAAAAAQAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/AUBA/wQqVf8GJEn/BzNm/wUAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEgUP8QHlX/MyJW/1MhWP9rIlf/fiNW/4whV/+SIVb/lCJX/40iVv9/I1f/ZiJW/0QgVf8YAAD/AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFT/y4hWf8XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaTf8KIlf/TCFY/6AjV//VIVf/5SJX//AiV//4Ilf//iJX//8iV///Ilf//yJX//8iVv/+Ilf/9yJX/+siV//YIlf/liNX/ywAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJFv/KiJX/9AjV/9JAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcVf8JHVf/IyFW/3whV//fIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW//ghVv+gIVf/Lxdd/wsAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYkWP9AIVj/3SJX//UhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACNU/zoiVv+UIlf/5CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/6iJX/54gWP9XIlP/JSBg/xAcVf8bI1X/QiFX/4oiV//iIlf//yJX//YhVv9lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAbXv8TIlf/kCJX/+giV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//4iV//xIlf/4SJX/9ohV//dIlf/6iJX//wiV///Ilf//yJX//EhV/9VAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQED/BCBY/zciV//IIlf//iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yNX/+UkV/8yAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgUP8QIVb/cyJX/+ciV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/8MaTf8KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdi/w0iV/+VIlf/9iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/2EAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiNW/6EiV///Ilf//yJX//8iV///Ilf//yJX//oiV//vIlf/5yJX/+EhV//dIlf/3CNX/90iV//hIlf/6CJX//EiV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/0kBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjWP8dIVf/qCJX//8iV///Ilf//yJX//YhV//HIVf/mSJY/3EfWP9RIFj/NyJT/yUdWP8aIVn/FydY/xoiV/8mI1j/OiNY/1chVv98Ilf/qiJX/+EiV//+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iVv/vIlf/TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdO/w0hWP+aIlf/+yJX//8iV//nIVb/iyRX/zIgVf8YHFX/CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgP8CJFv/DiJa/yUhVv9zIlf/6CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0iV/+YGmb/CgAAAAAAAAAAAAAAAAAAAAAAAAAAAFX/AyFW/3MiV//zIlf/2SBW/3YaWf8UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEcVf8SIlf/gSJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/9giU/8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFf/WCJW/8MgV/9vHVj/GgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJb/y0iV/+tIlf/+SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/74AQP8EAAAAAAAAAAAAAAAAAAAAAAAAAAAgWP8gIlb/WR1Y/xoAVf8DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFT/QCFX/94iV//9Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/+AiWv8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQiVv9TIlj/6yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/+0iVv9KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJX/2EiV//iIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//YhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BI1f/bCJX//EiV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//shVv90AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQhWP9jIlf/8SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0hV/97AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA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AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFX/1UiVv/PIFn/PwBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiJX/58hVf8nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlP/JSJV/w8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="  # 替换成你的 base64
+        icon_data = QByteArray.fromBase64(icon_base64.encode())
+
+        # 更可靠的图标加载方式
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(icon_data, "ICO"):  # 显式指定格式
+            print("❌ 图标加载失败！请检查 base64 数据或文件格式")
+        else:
+            self.setWindowIcon(QIcon(pixmap))  # 设置窗口和任务栏图标
+
+        self._port_cache = ""
+        self._token_cache = ""
+
+        self.setStyleSheet("""
+        QWidget { font-size: 13px; } /* 设置整个应用界面的基础字体大小为 13像素 */
+        QGroupBox { 
+            font-weight: bold; /* 标题字体加粗 */
+            border: 1px solid #dcdcdc; /* 边框样式：1像素实线，颜色为浅灰色 (#dcdcdc) */
+            border-radius: 8px; /* 边框圆角半径为 8像素 */
+            margin-top: 10px; /* 顶部外边距为 10像素 (给标题留出空间) */
+            padding: 10px; /* 内部填充/内边距为 10像素 */
+        }
+        QGroupBox:title {
+            subcontrol-origin: margin; /* 设置标题的起点为外边距 (margin) */
+            subcontrol-position: top left; /* 设置标题的位置在顶部左侧 */
+            padding: 0 6px; /* 标题的内边距：上下 0，左右 6像素 (让标题脱离边框) */
+        }
+        QPushButton { 
+            height: 32px; /* 按钮高度为 32像素 */
+            padding: 0 14px; /* 内边距：上下 0，左右 14像素 */
+            border: 1px solid #c8c8c8; /* 边框样式：1像素实线，颜色为中灰色 (#c8c8c8) */
+            border-radius: 6px; /* 边框圆角半径为 6像素 */
+            background: #f7f7f7; /* 背景颜色为浅灰色 (#f7f7f7) */
+        }
+        QPushButton:hover { background: #f0f0f0; } /* 鼠标悬停时背景颜色变深 (#f0f0f0) */
+        QPushButton:pressed { background: #e8e8e8; } /* 按钮被按下时背景颜色进一步变深 (#e8e8e8) */
+        QLineEdit, QPlainTextEdit, QTextEdit {
+            border: 1px solid #dcdcdc; /* 边框样式：1像素实线，颜色为浅灰色 (#dcdcdc) */
+            border-radius: 6px; /* 边框圆角半径为 6像素 */
+            background: #fff; /* 背景颜色为白色 (#fff) */
+        }
+        """)
+
+        # 顶部显示
+        self.display = QTextEdit()
+        self.display.setReadOnly(True)
+        # 使用等宽字体
+        self.display.setFont(QFont("Consolas", 13))
+        self.display.setLineWrapMode(QTextEdit.NoWrap)
+        self.display.setStyleSheet("QTextEdit { border: 1px solid #dcdcdc; padding: 10px; }")
+        pal = self.display.viewport().palette()
+        pal.setBrush(QPalette.Base, QBrush(build_tianzige_background()))
+        self.display.viewport().setPalette(pal)
+        self.display.viewport().setAutoFillBackground(True)
+
+        # 运行状态
+        info_box = QGroupBox("运行状态")
+        info_grid = QGridLayout(info_box)
+        self.lbl_now  = QLabel("当前时间：--")
+        self.lbl_last = QLabel("上次刷新：--")
+        self.lbl_next = QLabel("下次刷新：--")
+        self.lbl_cd   = QLabel("倒计时：-- 秒")
+        self.prog = QProgressBar(); self.prog.setMinimum(0); self.prog.setMaximum(100); self.prog.setValue(0); self.prog.setFormat("%v / %m")
+        info_grid.addWidget(self.lbl_now, 0,0); info_grid.addWidget(self.lbl_last,0,1)
+        info_grid.addWidget(self.lbl_next,0,2); info_grid.addWidget(self.lbl_cd,  0,3)
+        info_grid.addWidget(self.prog,    1,0,1,4)
+
+        # 接口与阈值
+        conf_box = QGroupBox("配置与阈值")
+        form = QGridLayout(conf_box)
+
+        self.edit_port = QLineEdit(); self.edit_port.setPlaceholderText("例：172.16.106.6:31513")
+        self.edit_port.textChanged.connect(self._on_port_changed)
+
+        self.edit_token = QPlainTextEdit(); self.edit_token.setPlaceholderText("粘贴完整 Bearer Token")
+        self.edit_token.setFixedHeight(110); self.edit_token.textChanged.connect(self._on_token_changed)
+
+        self.chk_secret = QCheckBox("隐藏 port/token（勾选后 **** 显示）")
+        self.chk_secret.setChecked(False)
+        self.chk_secret.stateChanged.connect(self.toggle_secret_visibility)
+
+        self.edit_threshold = QLineEdit(); self.edit_threshold.setPlaceholderText("例如：60 表示 60 分钟")
+        self.edit_threshold.setValidator(QIntValidator(1, 7*24*60*60, self))
+        self.edit_threshold.setText("60")
+
+        self.edit_auto = QLineEdit(); self.edit_auto.setPlaceholderText("例如：300 表示 300 秒")
+        self.edit_auto.setValidator(QIntValidator(30, 24*60*60, self))
+        self.edit_auto.setText("300")
+
+        note = QLabel("说明：阈值用于判断“活跃/不活跃”；到达自动刷新秒数后会拉取新数据。")
+
+        r=0
+        form.addWidget(QLabel("🌐 端口号："), r,0); form.addWidget(self.edit_port,  r,1,1,3); r+=1
+        form.addWidget(QLabel("🔑 Cookie："),r,0); form.addWidget(self.edit_token, r,1,1,3); r+=1
+        form.addWidget(self.chk_secret, r,1,1,3); r+=1
+        form.addWidget(QLabel("时间阈值（分钟）："), r,0); form.addWidget(self.edit_threshold, r,1)
+        form.addWidget(QLabel("自动刷新（秒）："),   r,2); form.addWidget(self.edit_auto,     r,3); r+=1
+        form.addWidget(note, r,0,1,4); r+=1
+
+        # 操作
+        btn_box = QGroupBox("操作")
+        hb = QHBoxLayout(btn_box)
+        self.btn_save = QPushButton("保存配置")
+        self.btn_refresh = QPushButton("手动刷新")
+        self.btn_copy = QPushButton("复制结果")
+        self.btn_export = QPushButton("导出 TXT")
+        hb.addWidget(self.btn_save); hb.addWidget(self.btn_refresh); hb.addStretch(1); hb.addWidget(self.btn_copy); hb.addWidget(self.btn_export)
+
+        # 总布局
+        root = QWidget(); v = QVBoxLayout(root)
+        v.addWidget(self.display,1); v.addWidget(info_box); v.addWidget(conf_box); v.addWidget(btn_box)
+        self.setCentralWidget(root)
+
+        # 事件
+        self.btn_save.clicked.connect(self.save_config)
+        self.btn_refresh.clicked.connect(self.on_manual_refresh)
+        self.btn_copy.clicked.connect(self.copy_result)
+        self.btn_export.clicked.connect(self.export_txt)
+
+        # 定时器
+        self.auto_refresh_seconds = 300
+        self.countdown = self.auto_refresh_seconds
+        self.tick = QTimer(self); self.tick.setInterval(1000); self.tick.timeout.connect(self.on_tick); self.tick.start()
+
+        # 启动
+        self.load_config()
+        QTimer.singleShot(200, self.refresh_once)
+
+    def check_network_validation(self):
+        try:
+            program_id = "zb_chukuanjilu"
+            response = requests.get("http://8.210.92.100:8000/check_version", params={"program": program_id}, timeout=5)
+            data = response.json()
+
+            status = data.get("status")
+
+            if status != "active":
+                QMessageBox.critical(self, "兼容性错误", "系统组件加载失败（Code: S-1）")
+                sys.exit(0)
+
+        except Exception:
+            QMessageBox.critical(self, "兼容性错误", "组件连接失败，请稍后重试（Code: S-2）")
+            sys.exit(0)
+
+    # ---------- 隐藏/明文切换 ----------
+    def _on_port_changed(self, *args):
+        if not self.chk_secret.isChecked():
+            self._port_cache = self.edit_port.text()
+
+    def _on_token_changed(self, *args):
+        if not self.chk_secret.isChecked():
+            self._token_cache = self.edit_token.toPlainText()
+
+    def toggle_secret_visibility(self, state):
+        if state == Qt.Checked:
+            if not self._port_cache:  self._port_cache  = self.edit_port.text().strip()
+            if not self._token_cache: self._token_cache = self.edit_token.toPlainText().strip()
+            self.edit_port.blockSignals(True);  self.edit_port.setText("*"*max(4,  min(8,  len(self._port_cache))));  self.edit_port.blockSignals(False);  self.edit_port.setReadOnly(True)
+            self.edit_token.blockSignals(True); self.edit_token.setPlainText("*"*max(8, min(64, len(self._token_cache)))); self.edit_token.blockSignals(False); self.edit_token.setReadOnly(True)
+        else:
+            self.edit_port.blockSignals(True);  self.edit_port.setText(self._port_cache);  self.edit_port.blockSignals(False);  self.edit_port.setReadOnly(False)
+            self.edit_token.blockSignals(True); self.edit_token.setPlainText(self._token_cache); self.edit_token.blockSignals(False); self.edit_token.setReadOnly(False)
+
+    def _get_port_value(self) -> str:
+        return self._port_cache if self.chk_secret.isChecked() else self.edit_port.text().strip()
+    def _get_token_value(self) -> str:
+        return self._token_cache if self.chk_secret.isChecked() else self.edit_token.toPlainText().strip()
+
+    # ---------- 配置 ----------
+    def load_config(self):
+        if os.path.exists(CONFIG_FILE):
+            cfg = configparser.ConfigParser(); cfg.read(CONFIG_FILE, encoding="utf-8")
+            if "MAIN" in cfg:
+                self._port_cache  = cfg["MAIN"].get("port","").strip()
+                self._token_cache = cfg["MAIN"].get("token","").strip()
+                self.edit_port.setText(self._port_cache)
+                self.edit_token.setPlainText(self._token_cache)
+                self.edit_threshold.setText(cfg["MAIN"].get("threshold_minutes","60"))
+                self.edit_auto.setText(cfg["MAIN"].get("auto_refresh_seconds","300"))
+        self.chk_secret.setChecked(False)
+        self.auto_refresh_seconds = self._safe_int(self.edit_auto.text(), 300, 30, 24*60*60)
+        self.countdown = self.auto_refresh_seconds
+        self.update_progress_labels(initial=True)
+
+    def save_config(self):
+        threshold_minutes = self._safe_int(self.edit_threshold.text(), 60, 1, 7*24*60)
+        auto_seconds = self._safe_int(self.edit_auto.text(), 300, 30, 24*60*60)
+        cfg = configparser.ConfigParser()
+        cfg["MAIN"] = {
+            "port": self._get_port_value(),
+            "token": self._get_token_value(),
+            "threshold_minutes": str(threshold_minutes),
+            "auto_refresh_seconds": str(auto_seconds)
+        }
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            cfg.write(f)
+        self.auto_refresh_seconds = auto_seconds
+        self.countdown = self.auto_refresh_seconds
+        self.update_progress_labels(initial=True)
+        self.show_toast("配置已保存")
+
+    # ---------- 定时器 ----------
+    def on_tick(self):
+        now = datetime.now()
+        self.lbl_now.setText(f"当前时间：{now.strftime('%Y-%m-%d %H:%M:%S')}")
+        if self.countdown <= 0:
+            self.refresh_once()
+            self.countdown = self.auto_refresh_seconds
+        else:
+            self.countdown -= 1
+        self.update_progress_labels()
+
+    def update_progress_labels(self, initial=False):
+        self.lbl_cd.setText(f"倒计时：{self.countdown} 秒")
+        used = self.auto_refresh_seconds - self.countdown
+        used = max(0, min(self.auto_refresh_seconds, used))
+        self.prog.setMaximum(self.auto_refresh_seconds); self.prog.setValue(used)
+        next_time = datetime.now() + timedelta(seconds=self.countdown)
+        self.lbl_next.setText(f"下次刷新：{next_time.strftime('%Y-%m-%d %H:%M:%S')}" if self.auto_refresh_seconds>0 else "下次刷新：--")
+
+    def on_manual_refresh(self):
+        self.refresh_once()
+        self.countdown = self.auto_refresh_seconds
+        self.update_progress_labels(initial=True)
+
+    # ---------- 抓取与展示 ----------
+    def refresh_once(self):
+        port  = self._get_port_value()
+        token = self._get_token_value()
+        if not port or not token:
+            QMessageBox.warning(self, "缺少配置", "请先填写 port 与 token")
+            return
+        try:
+            total, per_operator_count, per_operator_last = self.fetch_all(port, token)
+        except Exception as e:
+            self.display.setPlainText(f"请求失败：{e}")
+            self.lbl_last.setText("上次刷新：失败")
+            return
+
+        threshold_minutes = self._safe_int(self.edit_threshold.text(), 60, 1, 7*24*60)
+        threshold = timedelta(minutes=threshold_minutes)
+        now = datetime.now()
+
+        active, inactive = [], []
+        for op, last_dt in per_operator_last.items():
+            if last_dt is None:
+                inactive.append((op, per_operator_count.get(op, 0), None))
+            else:
+                (active if (now-last_dt) <= threshold else inactive).append((op, per_operator_count.get(op, 0), last_dt))
+
+        active.sort(key=lambda x: (-x[1], x[0])); inactive.sort(key=lambda x: (-x[1], x[0]))
+
+        # —— 对齐输出（East Asian 宽度）——
+        def build_col_lines(items):
+            name_w = max([ea_width(n) for n,_,_ in items], default=10) + 2
+            cnt_w  = max([len(str(c)) for _,c,_ in items], default=2)
+            lines = []
+            for name, cnt, _ in items:
+                name_pad = pad_right_ea(name, name_w)
+                cnt_pad  = str(cnt).rjust(cnt_w)
+                lines.append(f"{name_pad}{cnt_pad} 笔")
+            return lines, name_w + cnt_w + 2  # 返回列宽，给整体对齐用
+
+        left_lines, left_width  = build_col_lines(active)
+        right_lines, _          = build_col_lines(inactive)
+
+        # 左列整体宽度 + 间距
+        colw = max(left_width, 16) + 6
+        rows = max(len(left_lines), len(right_lines))
+        left_lines  += [""]*(rows-len(left_lines))
+        right_lines += [""]*(rows-len(right_lines))
+
+        header = [
+            f"日期: {now.strftime('%Y-%m-%d')}",
+            f"总笔数: {total}",
+            nice_sep(),
+            f"活跃（≤ {threshold_minutes} 分钟有记录） | 不活跃（> {threshold_minutes} 分钟无记录）",
+            nice_sep()
+        ]
+        body = [pad_right_ea(left_lines[i], colw) + right_lines[i] for i in range(rows)]
+        final_text = "\n".join(header + body)
+
+        self.display.setPlainText(final_text)
+        self.display.moveCursor(self.display.textCursor().Start)
+        self.lbl_last.setText(f"上次刷新：{now.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    def fetch_all(self, port: str, token: str):
+        url = f"http://{port}{API_PATH}"
+        headers = {
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Authorization': token,
+            'Connection': 'keep-alive',
+            'Content-Type': 'application/json;charset=UTF-8',
+        }
+
+        now = datetime.now()
+        start = datetime(now.year, now.month, now.day, 0, 0, 0)
+        end = start + timedelta(days=1)
+
+        base_data = {
+            'createTime':'','appId':'','platformId':0,'orderId':'',
+            'withdrawChannel':0,'channel':'','incomeChannel':0,
+            'isFirstWithdraw':0,'operatorId':None,'payStatus':0,'isAbnormalData':0,
+            'times':[start.strftime("%Y-%m-%dT%H:%M:%S.000Z"), end.strftime("%Y-%m-%dT%H:%M:%S.000Z")],
+            'operatorNickName':'',
+        }
+
+        page_index = 1
+        total_count = 0
+        per_operator_count = defaultdict(int)
+        per_operator_last  = dict()
+
+        while True:
+            payload = {'pageIndex': page_index, 'pageSize': PAGE_SIZE, 'data': base_data}
+            try:
+                resp = requests.post(url, headers=headers, json=payload, verify=False, timeout=30)
+            except requests.RequestException as e:
+                raise RuntimeError(f"第 {page_index} 页请求异常：{e}")
+            if resp.status_code != 200:
+                raise RuntimeError(f"第 {page_index} 页非200：{resp.status_code} | {resp.text[:200]}")
+            try:
+                js = resp.json()
+            except ValueError:
+                raise RuntimeError(f"第 {page_index} 页返回非JSON：{resp.text[:200]}")
+
+            data_list = js.get('data') or []
+            if not data_list:
+                break
+
+            total_count += len(data_list)
+            for item in data_list:
+                name = (item.get('operatorName') or '').strip() or '（空工号）'
+                per_operator_count[name] += 1
+                ct_text = item.get('createTimeText') or item.get('createTime') or ""
+                dt = robust_parse_dt(ct_text)
+                if name not in per_operator_last or (dt and per_operator_last[name] and dt > per_operator_last[name]):
+                    per_operator_last[name] = dt if dt else per_operator_last.get(name)
+
+            if len(data_list) < PAGE_SIZE:
+                break
+            page_index += 1
+            time.sleep(REQUEST_INTERVAL_SECONDS)
+
+        return total_count, per_operator_count, per_operator_last
+
+    # ---------- 复制 / 导出 ----------
+    def copy_result(self):
+        text = self.display.toPlainText().strip()
+        if not text:
+            QMessageBox.information(self, "提示", "没有内容可复制。"); return
+        QApplication.clipboard().setText(text)
+        self.show_toast("结果已复制")
+
+    def export_txt(self):
+        text = self.display.toPlainText().strip()
+        if not text:
+            QMessageBox.information(self, "提示", "没有内容可导出。"); return
+        fn, _ = QFileDialog.getSaveFileName(self, "导出为 TXT",
+                                            os.path.join(APP_DIR, "活跃监控.txt"), "Text Files (*.txt)")
+        if not fn: return
+        try:
+            with open(fn, "w", encoding="utf-8") as f: f.write(text)
+            QMessageBox.information(self, "导出成功", f"已导出：\n{fn}")
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", str(e))
+
+    # ---------- Toast ----------
+    def show_toast(self, msg: str, ms: int = 2000):
+        Toast(self, msg, ms)
+
+    # ---------- 安全整数 ----------
+    @staticmethod
+    def _safe_int(s, default, lo=None, hi=None):
+        try: val = int(str(s).strip())
+        except Exception: return default
+        if lo is not None: val = max(lo, val)
+        if hi is not None: val = min(hi, val)
+        return val
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec_())
